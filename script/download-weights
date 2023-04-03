@@ -2,27 +2,26 @@
 
 import os
 import shutil
-import sys
+from diffusers import StableDiffusionPipeline, DiffusionPipeline
 
-from diffusers import StableDiffusionPipeline
-from diffusers.pipelines.stable_diffusion.safety_checker import \
-    StableDiffusionSafetyChecker
+from shutil import copyfile
+from huggingface_hub import snapshot_download
 
-# append project directory to path so predict.py can be imported
-sys.path.append('.')
+MODEL_CACHE = "diffusers-cache"
 
-from predict import MODEL_CACHE, MODEL_ID, SAFETY_MODEL_ID
 
-if os.path.exists(MODEL_CACHE):
-    shutil.rmtree(MODEL_CACHE)
-os.makedirs(MODEL_CACHE, exist_ok=True)
+model_list = ["runwayml/stable-diffusion-v1-5"]
 
-saftey_checker = StableDiffusionSafetyChecker.from_pretrained(
-    SAFETY_MODEL_ID,
-    cache_dir=MODEL_CACHE,
-)
+for model in model_list:
+    if os.path.exists(MODEL_CACHE):
+        shutil.rmtree(MODEL_CACHE)
+    os.makedirs(MODEL_CACHE, exist_ok=True)
+   
+    pipe = DiffusionPipeline.from_pretrained(
+        pretrained_model_name_or_path=model,
+        safety_checker=None,
+        custom_pipeline="lpw_stable_diffusion",
+    )
+    pipe.save_pretrained("./"+MODEL_CACHE+"/"+model)
 
-pipe = StableDiffusionPipeline.from_pretrained(
-    MODEL_ID,
-    cache_dir=MODEL_CACHE,
-)
+#   I also made a thing that downloads lora files from huggingface to the /lora folder, but I figured you wouldn't need it here
