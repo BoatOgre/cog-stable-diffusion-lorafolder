@@ -1,10 +1,12 @@
 import os
 from typing import List
-
+##
 import torch
 from cog import BasePredictor, Input, Path
 from diffusers import (
     StableDiffusionPipeline,
+    StableDiffusionImg2ImgPipeline,
+    DiffusionPipeline,
     PNDMScheduler,
     LMSDiscreteScheduler,
     DDIMScheduler,
@@ -12,31 +14,57 @@ from diffusers import (
     EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
 )
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker,
-)
 
-# MODEL_ID refers to a diffusers-compatible model on HuggingFace
-# e.g. prompthero/openjourney-v2, wavymulder/Analog-Diffusion, etc
-MODEL_ID = "stabilityai/stable-diffusion-2-1"
+import subprocess
+import requests
+import wget
+
+import safetensors.torch
+from safetensors.torch import load_file
+
+import asyncio
+import threading
+
+import replicate as rep
+
+import random
+
+from lora_diffusion import LoRAManager, monkeypatch_remove_lora
+from t2i_adapters import Adapter
+from t2i_adapters import patch_pipe as patch_pipe_t2i_adapter
+
+from PIL import Image
+
+from hashlib import sha512
+
+import time
+import re
+import copy
+
+MODEL_ID = "runwayml/stable-diffusion-v1-5"
 MODEL_CACHE = "diffusers-cache"
-SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
 
 class Predictor(BasePredictor):
     def setup(self):
-        """Load the model into memory to make running multiple predictions efficient"""
+        ##
+        self.loralist = []
+        self.activeloras = {}
+
+        self.pipebackup = None
+
+        # Download the weights at runtime so you don't have to upload them to replicate with every push
+        subprocess.run("python3 script/download-weights", shell=True, check=True)
+        
         print("Loading pipeline...")
-        safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_MODEL_ID,
-            cache_dir=MODEL_CACHE,
+        self.pipe = DiffusionPipeline.from_pretrained(
+            pretrained_model_name_or_path="./"+MODEL_CACHE+"/"+MODEL_ID,
+            safety_checker=None,
             local_files_only=True,
+            custom_pipeline="lpw_stable_diffusion",
+            torch_dtype=torch.float16,
         )
-        self.pipe = StableDiffusionPipeline.from_pretrained(
-            MODEL_ID,
-            safety_checker=safety_checker,
-            cache_dir=MODEL_CACHE,
-            local_files_only=True,
-        ).to("cuda")
+
+        lora_folder(self)
 
     @torch.inference_mode()
     def predict(
@@ -91,6 +119,12 @@ class Predictor(BasePredictor):
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
     ) -> List[Path]:
+        if self.pipebackup != None:
+            self.pipe = self.pipebackup
+            self.pipebackup = None
+            
+        self.activeloras = {}
+        
         """Run a single prediction on the model"""
         if seed is None:
             seed = int.from_bytes(os.urandom(2), "big")
@@ -100,21 +134,63 @@ class Predictor(BasePredictor):
             raise ValueError(
                 "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
             )
+            
+        ## Applying LoRA
+            
+        for lora in self.loralist:
+            regex = r'<lora:' + lora + r':(.*?)>'
+            try:
+                compare = prompt
+                prompt = re.sub(regex, '', prompt)
+                prompt = re.sub(' +', ' ', prompt)
+                if prompt != compare and lora not in self.activeloras.keys():
+                    weight = re.search(regex, compare).group(1)
+                    weight = float(weight)
+                    self.activeloras[lora] = weight
+            except Exception as e:
+                print(repr(e))
+                pass
+            try:
+                compare = negative_prompt
+                negative_prompt = re.sub(regex, '', negative_prompt)
+                negative_prompt = re.sub(' +', ' ', negative_prompt)
+                if negative_prompt != compare and lora not in self.activeloras.keys():
+                    weight = re.search(regex, compare).group(1)
+                    weight = float(weight)
+                    self.activeloras[lora] = weight
+            except Exception as e:
+                print(repr(e))
+                pass
+
+        self.pipe = self.pipe.to("cpu")
+        
+        if len(self.activeloras) > 0:
+
+            st = time.time()
+            print("backing up pipe...")
+            self.pipebackup = copy.deepcopy(self.pipe)
+            print(f"backed up in: {time.time() - st}")
+
+            for lora, weight in self.activeloras.items():
+                print("Applying " + lora + " at weight " + str(weight))
+                apply_lora(self, "/loras/" + lora, alpha=weight)
+
+        self.pipe = self.pipe.to("cuda")
+        
+        ## LoRA applied
 
         self.pipe.scheduler = make_scheduler(scheduler, self.pipe.scheduler.config)
 
         generator = torch.Generator("cuda").manual_seed(seed)
-        output = self.pipe(
-            prompt=[prompt] * num_outputs if prompt is not None else None,
-            negative_prompt=[negative_prompt] * num_outputs
-            if negative_prompt is not None
-            else None,
-            width=width,
-            height=height,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            num_inference_steps=num_inference_steps,
-        )
+        output = self.pipe.text2img(
+                prompt=[prompt] * num_outputs if prompt is not None else None,
+                negative_prompt=[negative_prompt] * num_outputs if negative_prompt is not None else None,
+                width=width,
+                height=height,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                num_inference_steps=num_inference_steps
+            )
 
         output_paths = []
         for i, sample in enumerate(output.images):
@@ -131,6 +207,69 @@ class Predictor(BasePredictor):
             )
 
         return output_paths
+    
+    
+def lora_folder(self):
+    for filename in os.listdir("/loras"):
+        lora_id = filename.split(".")[0] if "." in filename else filename
+        self.loralist.append(lora_id)
+
+def apply_lora(self, model_path, alpha=0.75):
+    LORA_PREFIX_UNET = 'lora_unet'
+    LORA_PREFIX_TEXT_ENCODER = 'lora_te'
+    visited = []
+
+    state_dict = load_file(model_path, device="cpu")
+
+    for key in state_dict:
+
+        if '.alpha' in key or key in visited:
+            continue
+            
+        if 'text' in key:
+            layer_infos = key.split('.')[0].split(LORA_PREFIX_TEXT_ENCODER+'_')[-1].split('_')
+            curr_layer = self.pipe.text_encoder
+        else:
+            layer_infos = key.split('.')[0].split(LORA_PREFIX_UNET+'_')[-1].split('_')
+            curr_layer = self.pipe.unet
+
+        # find the target layer
+        temp_name = layer_infos.pop(0)
+        while len(layer_infos) > -1:
+            try:
+                curr_layer = curr_layer.__getattr__(temp_name)
+                if len(layer_infos) > 0:
+                    temp_name = layer_infos.pop(0)
+                elif len(layer_infos) == 0:
+                    break
+            except Exception:
+                if len(temp_name) > 0:
+                    temp_name += '_'+layer_infos.pop(0)
+                else:
+                    temp_name = layer_infos.pop(0)
+        
+        # org_forward(x) + lora_up(lora_down(x)) * multiplier
+        pair_keys = []
+        if 'lora_down' in key:
+            pair_keys.append(key.replace('lora_down', 'lora_up'))
+            pair_keys.append(key)
+        else:
+            pair_keys.append(key)
+            pair_keys.append(key.replace('lora_up', 'lora_down'))
+        
+        # update weight
+        if len(state_dict[pair_keys[0]].shape) == 4:
+            weight_up = state_dict[pair_keys[0]].squeeze(3).squeeze(2).to(torch.float32)
+            weight_down = state_dict[pair_keys[1]].squeeze(3).squeeze(2).to(torch.float32)
+            curr_layer.weight.data += alpha * torch.mm(weight_up, weight_down).unsqueeze(2).unsqueeze(3)
+        else:
+            weight_up = state_dict[pair_keys[0]].to(torch.float32)
+            weight_down = state_dict[pair_keys[1]].to(torch.float32)
+            curr_layer.weight.data += alpha * torch.mm(weight_up, weight_down)
+            
+        # update visited list
+        for item in pair_keys:
+            visited.append(item)
 
 
 def make_scheduler(name, config):
