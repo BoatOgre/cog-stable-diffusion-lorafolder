@@ -114,6 +114,7 @@ class Predictor(BasePredictor):
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
+        init_image: Path = Input(description="Initial image to use", default=None),
     ) -> List[Path]:
         if self.pipebackup != None:
             self.pipe = self.pipebackup
