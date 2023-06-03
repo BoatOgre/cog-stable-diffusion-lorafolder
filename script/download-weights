@@ -21,6 +21,7 @@ for model in model_list:
         pretrained_model_name_or_path=model,
         safety_checker=None,
         custom_pipeline="lpw_stable_diffusion",
+        custom_revision='0.15.1',
     )
     pipe.save_pretrained("./"+MODEL_CACHE+"/"+model)
 
