@@ -57,6 +57,7 @@ class Predictor(BasePredictor):
             safety_checker=None,
             local_files_only=True,
             custom_pipeline="lpw_stable_diffusion",
+            custom_revision='0.15.1',
             torch_dtype=torch.float16,
         )
 
